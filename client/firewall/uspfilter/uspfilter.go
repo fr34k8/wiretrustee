@@ -39,7 +39,9 @@ type RuleSet map[string]Rule
 
 // Manager userspace firewall manager
 type Manager struct {
-	outgoingRules  map[string]RuleSet
+	// outgoingRules is used for hooks only
+	outgoingRules map[string]RuleSet
+	// incomingRules is used for filtering and hooks
 	incomingRules  map[string]RuleSet
 	wgNetwork      *net.IPNet
 	decoders       sync.Pool
@@ -156,9 +158,8 @@ func (m *Manager) AddPeerFiltering(
 	proto firewall.Protocol,
 	sPort *firewall.Port,
 	dPort *firewall.Port,
-	direction firewall.RuleDirection,
 	action firewall.Action,
-	ipsetName string,
+	_ string,
 	comment string,
 ) ([]firewall.Rule, error) {
 	r := Rule{
@@ -166,7 +167,6 @@ func (m *Manager) AddPeerFiltering(
 		ip:        ip,
 		ipLayer:   layers.LayerTypeIPv6,
 		matchByIP: true,
-		direction: direction,
 		drop:      action == firewall.ActionDrop,
 		comment:   comment,
 	}
@@ -179,13 +179,8 @@ func (m *Manager) AddPeerFiltering(
 		r.matchByIP = false
 	}
 
-	if sPort != nil && len(sPort.Values) == 1 {
-		r.sPort = uint16(sPort.Values[0])
-	}
-
-	if dPort != nil && len(dPort.Values) == 1 {
-		r.dPort = uint16(dPort.Values[0])
-	}
+	r.sPort = sPort
+	r.dPort = dPort
 
 	switch proto {
 	case firewall.ProtocolTCP:
@@ -202,17 +197,10 @@ func (m *Manager) AddPeerFiltering(
 	}
 
 	m.mutex.Lock()
-	if direction == firewall.RuleDirectionIN {
-		if _, ok := m.incomingRules[r.ip.String()]; !ok {
-			m.incomingRules[r.ip.String()] = make(RuleSet)
-		}
-		m.incomingRules[r.ip.String()][r.id] = r
-	} else {
-		if _, ok := m.outgoingRules[r.ip.String()]; !ok {
-			m.outgoingRules[r.ip.String()] = make(RuleSet)
-		}
-		m.outgoingRules[r.ip.String()][r.id] = r
+	if _, ok := m.incomingRules[r.ip.String()]; !ok {
+		m.incomingRules[r.ip.String()] = make(RuleSet)
 	}
+	m.incomingRules[r.ip.String()][r.id] = r
 	m.mutex.Unlock()
 	return []firewall.Rule{&r}, nil
 }
@@ -241,19 +229,10 @@ func (m *Manager) DeletePeerRule(rule firewall.Rule) error {
 		return fmt.Errorf("delete rule: invalid rule type: %T", rule)
 	}
 
-	if r.direction == firewall.RuleDirectionIN {
-		_, ok := m.incomingRules[r.ip.String()][r.id]
-		if !ok {
-			return fmt.Errorf("delete rule: no rule with such id: %v", r.id)
-		}
-		delete(m.incomingRules[r.ip.String()], r.id)
-	} else {
-		_, ok := m.outgoingRules[r.ip.String()][r.id]
-		if !ok {
-			return fmt.Errorf("delete rule: no rule with such id: %v", r.id)
-		}
-		delete(m.outgoingRules[r.ip.String()], r.id)
+	if _, ok := m.incomingRules[r.ip.String()][r.id]; !ok {
+		return fmt.Errorf("delete rule: no rule with such id: %v", r.id)
 	}
+	delete(m.incomingRules[r.ip.String()], r.id)
 
 	return nil
 }
@@ -380,7 +359,7 @@ func (m *Manager) checkUDPHooks(d *decoder, dstIP net.IP, packetData []byte) boo
 	for _, ipKey := range []string{dstIP.String(), "0.0.0.0", "::"} {
 		if rules, exists := m.outgoingRules[ipKey]; exists {
 			for _, rule := range rules {
-				if rule.udpHook != nil && (rule.dPort == 0 || rule.dPort == uint16(d.udp.DstPort)) {
+				if rule.udpHook != nil && portsMatch(rule.dPort, uint16(d.udp.DstPort)) {
 					return rule.udpHook(packetData)
 				}
 			}
@@ -402,6 +381,8 @@ func (m *Manager) trackICMPOutbound(d *decoder, srcIP, dstIP net.IP) {
 
 // dropFilter implements filtering logic for incoming packets
 func (m *Manager) dropFilter(packetData []byte, rules map[string]RuleSet) bool {
+	// TODO: Disable router if --disable-server-router is set
+
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
@@ -498,6 +479,23 @@ func (m *Manager) applyRules(srcIP net.IP, packetData []byte, rules map[string]R
 	return true
 }
 
+func portsMatch(rulePort *firewall.Port, packetPort uint16) bool {
+	if rulePort == nil {
+		return true
+	}
+
+	if rulePort.IsRange {
+		return packetPort >= rulePort.Values[0] && packetPort <= rulePort.Values[1]
+	}
+
+	for _, p := range rulePort.Values {
+		if p == packetPort {
+			return true
+		}
+	}
+	return false
+}
+
 func validateRule(ip net.IP, packetData []byte, rules map[string]Rule, d *decoder) (bool, bool) {
 	payloadLayer := d.decoded[1]
 	for _, rule := range rules {
@@ -515,13 +513,7 @@ func validateRule(ip net.IP, packetData []byte, rules map[string]Rule, d *decode
 
 		switch payloadLayer {
 		case layers.LayerTypeTCP:
-			if rule.sPort == 0 && rule.dPort == 0 {
-				return rule.drop, true
-			}
-			if rule.sPort != 0 && rule.sPort == uint16(d.tcp.SrcPort) {
-				return rule.drop, true
-			}
-			if rule.dPort != 0 && rule.dPort == uint16(d.tcp.DstPort) {
+			if portsMatch(rule.sPort, uint16(d.tcp.SrcPort)) && portsMatch(rule.dPort, uint16(d.tcp.DstPort)) {
 				return rule.drop, true
 			}
 		case layers.LayerTypeUDP:
@@ -531,13 +523,7 @@ func validateRule(ip net.IP, packetData []byte, rules map[string]Rule, d *decode
 				return rule.udpHook(packetData), true
 			}
 
-			if rule.sPort == 0 && rule.dPort == 0 {
-				return rule.drop, true
-			}
-			if rule.sPort != 0 && rule.sPort == uint16(d.udp.SrcPort) {
-				return rule.drop, true
-			}
-			if rule.dPort != 0 && rule.dPort == uint16(d.udp.DstPort) {
+			if portsMatch(rule.sPort, uint16(d.udp.SrcPort)) && portsMatch(rule.dPort, uint16(d.udp.DstPort)) {
 				return rule.drop, true
 			}
 		case layers.LayerTypeICMPv4, layers.LayerTypeICMPv6:
@@ -562,9 +548,8 @@ func (m *Manager) AddUDPPacketHook(
 		id:         uuid.New().String(),
 		ip:         ip,
 		protoLayer: layers.LayerTypeUDP,
-		dPort:      dPort,
+		dPort:      &firewall.Port{Values: []uint16{dPort}},
 		ipLayer:    layers.LayerTypeIPv6,
-		direction:  firewall.RuleDirectionOUT,
 		comment:    fmt.Sprintf("UDP Hook direction: %v, ip:%v, dport:%d", in, ip, dPort),
 		udpHook:    hook,
 	}
@@ -575,7 +560,6 @@ func (m *Manager) AddUDPPacketHook(
 
 	m.mutex.Lock()
 	if in {
-		r.direction = firewall.RuleDirectionIN
 		if _, ok := m.incomingRules[r.ip.String()]; !ok {
 			m.incomingRules[r.ip.String()] = make(map[string]Rule)
 		}
@@ -594,19 +578,22 @@ func (m *Manager) AddUDPPacketHook(
 
 // RemovePacketHook removes packet hook by given ID
 func (m *Manager) RemovePacketHook(hookID string) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
 	for _, arr := range m.incomingRules {
 		for _, r := range arr {
 			if r.id == hookID {
-				rule := r
-				return m.DeletePeerRule(&rule)
+				delete(arr, r.id)
+				return nil
 			}
 		}
 	}
 	for _, arr := range m.outgoingRules {
 		for _, r := range arr {
 			if r.id == hookID {
-				rule := r
-				return m.DeletePeerRule(&rule)
+				delete(arr, r.id)
+				return nil
 			}
 		}
 	}

@@ -69,12 +69,11 @@ func TestManagerAddPeerFiltering(t *testing.T) {
 
 	ip := net.ParseIP("192.168.1.1")
 	proto := fw.ProtocolTCP
-	port := &fw.Port{Values: []int{80}}
-	direction := fw.RuleDirectionOUT
+	port := &fw.Port{Values: []uint16{80}}
 	action := fw.ActionDrop
 	comment := "Test rule"
 
-	rule, err := m.AddPeerFiltering(ip, proto, nil, port, direction, action, "", comment)
+	rule, err := m.AddPeerFiltering(ip, proto, nil, port, action, "", comment)
 	if err != nil {
 		t.Errorf("failed to add filtering: %v", err)
 		return
@@ -104,36 +103,14 @@ func TestManagerDeleteRule(t *testing.T) {
 
 	ip := net.ParseIP("192.168.1.1")
 	proto := fw.ProtocolTCP
-	port := &fw.Port{Values: []int{80}}
-	direction := fw.RuleDirectionOUT
+	port := &fw.Port{Values: []uint16{80}}
 	action := fw.ActionDrop
-	comment := "Test rule"
+	comment := "Test rule 2"
 
-	rule, err := m.AddPeerFiltering(ip, proto, nil, port, direction, action, "", comment)
+	rule2, err := m.AddPeerFiltering(ip, proto, nil, port, action, "", comment)
 	if err != nil {
 		t.Errorf("failed to add filtering: %v", err)
 		return
-	}
-
-	ip = net.ParseIP("192.168.1.1")
-	proto = fw.ProtocolTCP
-	port = &fw.Port{Values: []int{80}}
-	direction = fw.RuleDirectionIN
-	action = fw.ActionDrop
-	comment = "Test rule 2"
-
-	rule2, err := m.AddPeerFiltering(ip, proto, nil, port, direction, action, "", comment)
-	if err != nil {
-		t.Errorf("failed to add filtering: %v", err)
-		return
-	}
-
-	for _, r := range rule {
-		err = m.DeletePeerRule(r)
-		if err != nil {
-			t.Errorf("failed to delete rule: %v", err)
-			return
-		}
 	}
 
 	for _, r := range rule2 {
@@ -217,16 +194,12 @@ func TestAddUDPPacketHook(t *testing.T) {
 				t.Errorf("expected ip %s, got %s", tt.ip, addedRule.ip)
 				return
 			}
-			if tt.dPort != addedRule.dPort {
-				t.Errorf("expected dPort %d, got %d", tt.dPort, addedRule.dPort)
+			if tt.dPort != addedRule.dPort.Values[0] {
+				t.Errorf("expected dPort %d, got %d", tt.dPort, addedRule.dPort.Values[0])
 				return
 			}
 			if layers.LayerTypeUDP != addedRule.protoLayer {
 				t.Errorf("expected protoLayer %s, got %s", layers.LayerTypeUDP, addedRule.protoLayer)
-				return
-			}
-			if tt.expDir != addedRule.direction {
-				t.Errorf("expected direction %d, got %d", tt.expDir, addedRule.direction)
 				return
 			}
 			if addedRule.udpHook == nil {
@@ -250,12 +223,11 @@ func TestManagerReset(t *testing.T) {
 
 	ip := net.ParseIP("192.168.1.1")
 	proto := fw.ProtocolTCP
-	port := &fw.Port{Values: []int{80}}
-	direction := fw.RuleDirectionOUT
+	port := &fw.Port{Values: []uint16{80}}
 	action := fw.ActionDrop
 	comment := "Test rule"
 
-	_, err = m.AddPeerFiltering(ip, proto, nil, port, direction, action, "", comment)
+	_, err = m.AddPeerFiltering(ip, proto, nil, port, action, "", comment)
 	if err != nil {
 		t.Errorf("failed to add filtering: %v", err)
 		return
@@ -289,11 +261,10 @@ func TestNotMatchByIP(t *testing.T) {
 
 	ip := net.ParseIP("0.0.0.0")
 	proto := fw.ProtocolUDP
-	direction := fw.RuleDirectionOUT
 	action := fw.ActionAccept
 	comment := "Test rule"
 
-	_, err = m.AddPeerFiltering(ip, proto, nil, nil, direction, action, "", comment)
+	_, err = m.AddPeerFiltering(ip, proto, nil, nil, action, "", comment)
 	if err != nil {
 		t.Errorf("failed to add filtering: %v", err)
 		return
@@ -327,7 +298,7 @@ func TestNotMatchByIP(t *testing.T) {
 		return
 	}
 
-	if m.dropFilter(buf.Bytes(), m.outgoingRules) {
+	if m.dropFilter(buf.Bytes(), m.incomingRules) {
 		t.Errorf("expected packet to be accepted")
 		return
 	}
@@ -492,12 +463,8 @@ func TestUSPFilterCreatePerformance(t *testing.T) {
 			ip := net.ParseIP("10.20.0.100")
 			start := time.Now()
 			for i := 0; i < testMax; i++ {
-				port := &fw.Port{Values: []int{1000 + i}}
-				if i%2 == 0 {
-					_, err = manager.AddPeerFiltering(ip, "tcp", nil, port, fw.RuleDirectionOUT, fw.ActionAccept, "", "accept HTTP traffic")
-				} else {
-					_, err = manager.AddPeerFiltering(ip, "tcp", nil, port, fw.RuleDirectionIN, fw.ActionAccept, "", "accept HTTP traffic")
-				}
+				port := &fw.Port{Values: []uint16{uint16(1000 + i)}}
+				_, err = manager.AddPeerFiltering(ip, "tcp", nil, port, fw.ActionAccept, "", "accept HTTP traffic")
 
 				require.NoError(t, err, "failed to add rule")
 			}

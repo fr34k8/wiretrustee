@@ -59,13 +59,8 @@ func NewConnectClient(
 }
 
 // Run with main logic.
-func (c *ConnectClient) Run() error {
-	return c.run(MobileDependency{}, nil, nil)
-}
-
-// RunWithProbes runs the client's main logic with probes attached
-func (c *ConnectClient) RunWithProbes(probes *ProbeHolder, runningChan chan error) error {
-	return c.run(MobileDependency{}, probes, runningChan)
+func (c *ConnectClient) Run(runningChan chan error) error {
+	return c.run(MobileDependency{}, runningChan)
 }
 
 // RunOnAndroid with main logic on mobile system
@@ -84,7 +79,7 @@ func (c *ConnectClient) RunOnAndroid(
 		HostDNSAddresses:      dnsAddresses,
 		DnsReadyListener:      dnsReadyListener,
 	}
-	return c.run(mobileDependency, nil, nil)
+	return c.run(mobileDependency, nil)
 }
 
 func (c *ConnectClient) RunOniOS(
@@ -102,10 +97,10 @@ func (c *ConnectClient) RunOniOS(
 		DnsManager:            dnsManager,
 		StateFilePath:         stateFilePath,
 	}
-	return c.run(mobileDependency, nil, nil)
+	return c.run(mobileDependency, nil)
 }
 
-func (c *ConnectClient) run(mobileDependency MobileDependency, probes *ProbeHolder, runningChan chan error) error {
+func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan error) error {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Panicf("Panic occurred: %v, stack trace: %s", r, string(debug.Stack()))
@@ -183,7 +178,7 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, probes *ProbeHold
 		}()
 
 		// connect (just a connection, no stream yet) and login to Management Service to get an initial global Wiretrustee config
-		loginResp, err := loginToManagement(engineCtx, mgmClient, publicSSHKey)
+		loginResp, err := loginToManagement(engineCtx, mgmClient, publicSSHKey, c.config)
 		if err != nil {
 			log.Debug(err)
 			if s, ok := gstatus.FromError(err); ok && (s.Code() == codes.PermissionDenied) {
@@ -261,7 +256,7 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, probes *ProbeHold
 		checks := loginResp.GetChecks()
 
 		c.engineMutex.Lock()
-		c.engine = NewEngineWithProbes(engineCtx, cancel, signalClient, mgmClient, relayManager, engineConfig, mobileDependency, c.statusRecorder, probes, checks)
+		c.engine = NewEngine(engineCtx, cancel, signalClient, mgmClient, relayManager, engineConfig, mobileDependency, c.statusRecorder, checks)
 		c.engine.SetNetworkMapPersistence(c.persistNetworkMap)
 		c.engineMutex.Unlock()
 
@@ -382,8 +377,7 @@ func (c *ConnectClient) isContextCancelled() bool {
 // SetNetworkMapPersistence enables or disables network map persistence.
 // When enabled, the last received network map will be stored and can be retrieved
 // through the Engine's getLatestNetworkMap method. When disabled, any stored
-// network map will be cleared. This functionality is primarily used for debugging
-// and should not be enabled during normal operation.
+// network map will be cleared.
 func (c *ConnectClient) SetNetworkMapPersistence(enabled bool) {
 	c.engineMutex.Lock()
 	c.persistNetworkMap = enabled
@@ -416,6 +410,13 @@ func createEngineConfig(key wgtypes.Key, config *Config, peerConfig *mgmProto.Pe
 		RosenpassPermissive:  config.RosenpassPermissive,
 		ServerSSHAllowed:     util.ReturnBoolWithDefaultTrue(config.ServerSSHAllowed),
 		DNSRouteInterval:     config.DNSRouteInterval,
+
+		DisableClientRoutes: config.DisableClientRoutes,
+		DisableServerRoutes: config.DisableServerRoutes,
+		DisableDNS:          config.DisableDNS,
+		DisableFirewall:     config.DisableFirewall,
+
+		BlockLANAccess: config.BlockLANAccess,
 	}
 
 	if config.PreSharedKey != "" {
@@ -457,7 +458,7 @@ func connectToSignal(ctx context.Context, wtConfig *mgmProto.WiretrusteeConfig, 
 }
 
 // loginToManagement creates Management Services client, establishes a connection, logs-in and gets a global Wiretrustee config (signal, turn, stun hosts, etc)
-func loginToManagement(ctx context.Context, client mgm.Client, pubSSHKey []byte) (*mgmProto.LoginResponse, error) {
+func loginToManagement(ctx context.Context, client mgm.Client, pubSSHKey []byte, config *Config) (*mgmProto.LoginResponse, error) {
 
 	serverPublicKey, err := client.GetServerPublicKey()
 	if err != nil {
@@ -465,6 +466,15 @@ func loginToManagement(ctx context.Context, client mgm.Client, pubSSHKey []byte)
 	}
 
 	sysInfo := system.GetInfo(ctx)
+	sysInfo.SetFlags(
+		config.RosenpassEnabled,
+		config.RosenpassPermissive,
+		config.ServerSSHAllowed,
+		config.DisableClientRoutes,
+		config.DisableServerRoutes,
+		config.DisableDNS,
+		config.DisableFirewall,
+	)
 	loginResp, err := client.Login(*serverPublicKey, sysInfo, pubSSHKey)
 	if err != nil {
 		return nil, err
