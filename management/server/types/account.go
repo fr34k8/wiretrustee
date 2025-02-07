@@ -289,14 +289,14 @@ func (a *Account) GetPeerNetworkMap(
 	}
 
 	if metrics != nil {
-		objectCount := int64(len(peersToConnect) + len(expiredPeers) + len(routesUpdate) + len(firewallRules))
+		objectCount := int64(len(peersToConnectIncludingRouters) + len(expiredPeers) + len(routesUpdate) + len(networkResourcesRoutes) + len(firewallRules) + +len(networkResourcesFirewallRules) + len(routesFirewallRules))
 		metrics.CountNetworkMapObjects(objectCount)
 		metrics.CountGetPeerNetworkMapDuration(time.Since(start))
 
 		if objectCount > 5000 {
 			log.WithContext(ctx).Tracef("account: %s has a total resource count of %d objects, "+
-				"peers to connect: %d, expired peers: %d, routes: %d, firewall rules: %d",
-				a.Id, objectCount, len(peersToConnect), len(expiredPeers), len(routesUpdate), len(firewallRules))
+				"peers to connect: %d, expired peers: %d, routes: %d, firewall rules: %d, network resources routes: %d, network resources firewall rules: %d, routes firewall rules: %d",
+				a.Id, objectCount, len(peersToConnectIncludingRouters), len(expiredPeers), len(routesUpdate), len(firewallRules), len(networkResourcesRoutes), len(networkResourcesFirewallRules), len(routesFirewallRules))
 		}
 	}
 
@@ -1288,6 +1288,10 @@ func (a *Account) getNetworkResourceGroups(resourceID string) []*Group {
 func (a *Account) GetResourcePoliciesMap() map[string][]*Policy {
 	resourcePolicies := make(map[string][]*Policy)
 	for _, resource := range a.NetworkResources {
+		if !resource.Enabled {
+			continue
+		}
+
 		resourceAppliedPolicies := a.GetPoliciesForNetworkResource(resource.ID)
 		resourcePolicies[resource.ID] = resourceAppliedPolicies
 	}
@@ -1301,6 +1305,10 @@ func (a *Account) GetNetworkResourcesRoutesToSync(ctx context.Context, peerID st
 	allSourcePeers := make(map[string]struct{}, len(a.Peers))
 
 	for _, resource := range a.NetworkResources {
+		if !resource.Enabled {
+			continue
+		}
+
 		var addSourcePeers bool
 
 		networkRoutingPeers, exists := routers[resource.NetworkID]
@@ -1455,6 +1463,10 @@ func (a *Account) GetResourceRoutersMap() map[string]map[string]*routerTypes.Net
 	routers := make(map[string]map[string]*routerTypes.NetworkRouter)
 
 	for _, router := range a.NetworkRouters {
+		if !router.Enabled {
+			continue
+		}
+
 		if routers[router.NetworkID] == nil {
 			routers[router.NetworkID] = make(map[string]*routerTypes.NetworkRouter)
 		}
