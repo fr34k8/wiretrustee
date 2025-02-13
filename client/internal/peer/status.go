@@ -84,6 +84,12 @@ type LocalPeerState struct {
 	Routes          map[string]struct{}
 }
 
+// Clone returns a copy of the LocalPeerState
+func (l LocalPeerState) Clone() LocalPeerState {
+	l.Routes = maps.Clone(l.Routes)
+	return l
+}
+
 // SignalState contains the latest state of a signal connection
 type SignalState struct {
 	URL       string
@@ -501,7 +507,7 @@ func (d *Status) GetPeerStateChangeNotifier(peer string) <-chan struct{} {
 func (d *Status) GetLocalPeerState() LocalPeerState {
 	d.mux.Lock()
 	defer d.mux.Unlock()
-	return d.localPeer
+	return d.localPeer.Clone()
 }
 
 // UpdateLocalPeerState updates local peer status
@@ -715,7 +721,9 @@ func (d *Status) GetRelayStates() []relay.ProbeResult {
 func (d *Status) GetDNSStates() []NSGroupState {
 	d.mux.Lock()
 	defer d.mux.Unlock()
-	return d.nsGroupStates
+
+	// shallow copy is good enough, as slices fields are currently not updated
+	return slices.Clone(d.nsGroupStates)
 }
 
 func (d *Status) GetResolvedDomainsStates() map[domain.Domain]ResolvedDomainInfo {
