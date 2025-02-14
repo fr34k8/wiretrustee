@@ -11,20 +11,19 @@ import (
 	"net/netip"
 	"testing"
 
+	"github.com/gorilla/mux"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/netbirdio/netbird/management/domain"
 	"github.com/netbirdio/netbird/management/server/http/api"
+	"github.com/netbirdio/netbird/management/server/jwtclaims"
+	"github.com/netbirdio/netbird/management/server/mock_server"
 	nbpeer "github.com/netbirdio/netbird/management/server/peer"
 	"github.com/netbirdio/netbird/management/server/status"
 	"github.com/netbirdio/netbird/management/server/types"
+	"github.com/netbirdio/netbird/management/server/util"
 	"github.com/netbirdio/netbird/route"
-
-	"github.com/gorilla/mux"
-	"github.com/magiconair/properties/assert"
-
-	"github.com/netbirdio/netbird/management/domain"
-	"github.com/netbirdio/netbird/management/server/jwtclaims"
-	"github.com/netbirdio/netbird/management/server/mock_server"
 )
 
 const (
@@ -239,7 +238,7 @@ func TestRoutesHandlers(t *testing.T) {
 				Id:          existingRouteID,
 				Description: "Post",
 				NetworkId:   "awesomeNet",
-				Network:     toPtr("192.168.0.0/16"),
+				Network:     util.ToPtr("192.168.0.0/16"),
 				Peer:        &existingPeerID,
 				NetworkType: route.IPv4NetworkString,
 				Masquerade:  false,
@@ -259,7 +258,7 @@ func TestRoutesHandlers(t *testing.T) {
 				Id:          existingRouteID,
 				Description: "Post",
 				NetworkId:   "domainNet",
-				Network:     toPtr("invalid Prefix"),
+				Network:     util.ToPtr("invalid Prefix"),
 				KeepRoute:   true,
 				Domains:     &[]string{existingDomain},
 				Peer:        &existingPeerID,
@@ -281,7 +280,7 @@ func TestRoutesHandlers(t *testing.T) {
 				Id:                  existingRouteID,
 				Description:         "Post",
 				NetworkId:           "awesomeNet",
-				Network:             toPtr("192.168.0.0/16"),
+				Network:             util.ToPtr("192.168.0.0/16"),
 				Peer:                &existingPeerID,
 				NetworkType:         route.IPv4NetworkString,
 				Masquerade:          false,
@@ -385,7 +384,7 @@ func TestRoutesHandlers(t *testing.T) {
 				Id:          existingRouteID,
 				Description: "Post",
 				NetworkId:   "awesomeNet",
-				Network:     toPtr("192.168.0.0/16"),
+				Network:     util.ToPtr("192.168.0.0/16"),
 				Peer:        &existingPeerID,
 				NetworkType: route.IPv4NetworkString,
 				Masquerade:  false,
@@ -404,7 +403,7 @@ func TestRoutesHandlers(t *testing.T) {
 				Id:          existingRouteID,
 				Description: "Post",
 				NetworkId:   "awesomeNet",
-				Network:     toPtr("invalid Prefix"),
+				Network:     util.ToPtr("invalid Prefix"),
 				Domains:     &[]string{existingDomain},
 				Peer:        &existingPeerID,
 				NetworkType: route.DomainNetworkString,
@@ -425,7 +424,7 @@ func TestRoutesHandlers(t *testing.T) {
 				Id:          existingRouteID,
 				Description: "Post",
 				NetworkId:   "awesomeNet",
-				Network:     toPtr("192.168.0.0/16"),
+				Network:     util.ToPtr("192.168.0.0/16"),
 				Peer:        &emptyString,
 				PeerGroups:  &[]string{existingGroupID},
 				NetworkType: route.IPv4NetworkString,
@@ -662,8 +661,4 @@ func toApiRoute(t *testing.T, r *route.Route) *api.Route {
 	}
 	require.NoError(t, err, "Failed to convert route")
 	return apiRoute
-}
-
-func toPtr[T any](v T) *T {
-	return &v
 }

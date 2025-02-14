@@ -18,6 +18,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/netbirdio/netbird/dns"
+	"github.com/netbirdio/netbird/management/server/testutil"
 	"github.com/netbirdio/netbird/management/server/types"
 
 	"github.com/netbirdio/netbird/management/server/telemetry"
@@ -29,7 +30,6 @@ import (
 	networkTypes "github.com/netbirdio/netbird/management/server/networks/types"
 	nbpeer "github.com/netbirdio/netbird/management/server/peer"
 	"github.com/netbirdio/netbird/management/server/posture"
-	"github.com/netbirdio/netbird/management/server/testutil"
 	"github.com/netbirdio/netbird/route"
 )
 
@@ -50,8 +50,9 @@ type Store interface {
 	GetAccountByUser(ctx context.Context, userID string) (*types.Account, error)
 	GetAccountByPeerPubKey(ctx context.Context, peerKey string) (*types.Account, error)
 	GetAccountIDByPeerPubKey(ctx context.Context, peerKey string) (string, error)
-	GetAccountIDByUserID(userID string) (string, error)
+	GetAccountIDByUserID(ctx context.Context, lockStrength LockingStrength, userID string) (string, error)
 	GetAccountIDBySetupKey(ctx context.Context, peerKey string) (string, error)
+	GetAccountIDByPeerID(ctx context.Context, lockStrength LockingStrength, peerID string) (string, error)
 	GetAccountByPeerID(ctx context.Context, peerID string) (*types.Account, error)
 	GetAccountBySetupKey(ctx context.Context, setupKey string) (*types.Account, error) // todo use key hash later
 	GetAccountByPrivateDomain(ctx context.Context, domain string) (*types.Account, error)
@@ -97,18 +98,24 @@ type Store interface {
 	DeletePostureChecks(ctx context.Context, lockStrength LockingStrength, accountID, postureChecksID string) error
 
 	GetPeerLabelsInAccount(ctx context.Context, lockStrength LockingStrength, accountId string) ([]string, error)
-	AddPeerToAllGroup(ctx context.Context, accountID string, peerID string) error
-	AddPeerToGroup(ctx context.Context, accountId string, peerId string, groupID string) error
+	AddPeerToAllGroup(ctx context.Context, lockStrength LockingStrength, accountID string, peerID string) error
+	AddPeerToGroup(ctx context.Context, lockStrength LockingStrength, accountId string, peerId string, groupID string) error
+	GetPeerGroups(ctx context.Context, lockStrength LockingStrength, accountId string, peerId string) ([]*types.Group, error)
 	AddResourceToGroup(ctx context.Context, accountId string, groupID string, resource *types.Resource) error
 	RemoveResourceFromGroup(ctx context.Context, accountId string, groupID string, resourceID string) error
-	AddPeerToAccount(ctx context.Context, peer *nbpeer.Peer) error
+	AddPeerToAccount(ctx context.Context, lockStrength LockingStrength, peer *nbpeer.Peer) error
 	GetPeerByPeerPubKey(ctx context.Context, lockStrength LockingStrength, peerKey string) (*nbpeer.Peer, error)
+	GetAccountPeers(ctx context.Context, lockStrength LockingStrength, accountID string) ([]*nbpeer.Peer, error)
 	GetUserPeers(ctx context.Context, lockStrength LockingStrength, accountID, userID string) ([]*nbpeer.Peer, error)
 	GetPeerByID(ctx context.Context, lockStrength LockingStrength, accountID string, peerID string) (*nbpeer.Peer, error)
 	GetPeersByIDs(ctx context.Context, lockStrength LockingStrength, accountID string, peerIDs []string) (map[string]*nbpeer.Peer, error)
-	SavePeer(ctx context.Context, accountID string, peer *nbpeer.Peer) error
-	SavePeerStatus(accountID, peerID string, status nbpeer.PeerStatus) error
-	SavePeerLocation(accountID string, peer *nbpeer.Peer) error
+	GetAccountPeersWithExpiration(ctx context.Context, lockStrength LockingStrength, accountID string) ([]*nbpeer.Peer, error)
+	GetAccountPeersWithInactivity(ctx context.Context, lockStrength LockingStrength, accountID string) ([]*nbpeer.Peer, error)
+	GetAllEphemeralPeers(ctx context.Context, lockStrength LockingStrength) ([]*nbpeer.Peer, error)
+	SavePeer(ctx context.Context, lockStrength LockingStrength, accountID string, peer *nbpeer.Peer) error
+	SavePeerStatus(ctx context.Context, lockStrength LockingStrength, accountID, peerID string, status nbpeer.PeerStatus) error
+	SavePeerLocation(ctx context.Context, lockStrength LockingStrength, accountID string, peer *nbpeer.Peer) error
+	DeletePeer(ctx context.Context, lockStrength LockingStrength, accountID string, peerID string) error
 
 	GetSetupKeyBySecret(ctx context.Context, lockStrength LockingStrength, key string) (*types.SetupKey, error)
 	IncrementSetupKeyUsage(ctx context.Context, setupKeyID string) error
@@ -171,8 +178,10 @@ const (
 	FileStoreEngine     Engine = "jsonfile"
 	SqliteStoreEngine   Engine = "sqlite"
 	PostgresStoreEngine Engine = "postgres"
+	MysqlStoreEngine    Engine = "mysql"
 
 	postgresDsnEnv = "NETBIRD_STORE_ENGINE_POSTGRES_DSN"
+	mysqlDsnEnv    = "NETBIRD_STORE_ENGINE_MYSQL_DSN"
 )
 
 func getStoreEngineFromEnv() Engine {
@@ -183,7 +192,7 @@ func getStoreEngineFromEnv() Engine {
 	}
 
 	value := Engine(strings.ToLower(kind))
-	if value == SqliteStoreEngine || value == PostgresStoreEngine {
+	if value == SqliteStoreEngine || value == PostgresStoreEngine || value == MysqlStoreEngine {
 		return value
 	}
 
@@ -234,6 +243,9 @@ func NewStore(ctx context.Context, kind Engine, dataDir string, metrics telemetr
 	case PostgresStoreEngine:
 		log.WithContext(ctx).Info("using Postgres store engine")
 		return newPostgresStore(ctx, metrics)
+	case MysqlStoreEngine:
+		log.WithContext(ctx).Info("using MySQL store engine")
+		return newMysqlStore(ctx, metrics)
 	default:
 		return nil, fmt.Errorf("unsupported kind of store: %s", kind)
 	}
@@ -283,6 +295,12 @@ func getMigrations(ctx context.Context) []migrationFunc {
 		func(db *gorm.DB) error {
 			return migration.MigrateSetupKeyToHashedSetupKey[types.SetupKey](ctx, db)
 		},
+		func(db *gorm.DB) error {
+			return migration.MigrateNewField[resourceTypes.NetworkResource](ctx, db, "enabled", true)
+		},
+		func(db *gorm.DB) error {
+			return migration.MigrateNewField[routerTypes.NetworkRouter](ctx, db, "enabled", true)
+		},
 	}
 }
 
@@ -301,7 +319,7 @@ func NewTestStoreFromSQL(ctx context.Context, filename string, dataDir string) (
 	}
 
 	file := filepath.Join(dataDir, storeStr)
-	db, err := gorm.Open(sqlite.Open(file), getGormConfig())
+	db, err := gorm.Open(sqlite.Open(file), getGormConfig(kind))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -317,12 +335,13 @@ func NewTestStoreFromSQL(ctx context.Context, filename string, dataDir string) (
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create test store: %v", err)
 	}
-	cleanUp := func() {
-		store.Close(ctx)
-	}
 
+	return getSqlStoreEngine(ctx, store, kind)
+}
+
+func getSqlStoreEngine(ctx context.Context, store *SqlStore, kind Engine) (Store, func(), error) {
 	if kind == PostgresStoreEngine {
-		cleanUp, err = testutil.CreatePGDB()
+		cleanUp, err := testutil.CreatePostgresTestContainer()
 		if err != nil {
 			return nil, nil, err
 		}
@@ -336,9 +355,34 @@ func NewTestStoreFromSQL(ctx context.Context, filename string, dataDir string) (
 		if err != nil {
 			return nil, nil, err
 		}
+
+		return store, cleanUp, nil
 	}
 
-	return store, cleanUp, nil
+	if kind == MysqlStoreEngine {
+		cleanUp, err := testutil.CreateMysqlTestContainer()
+		if err != nil {
+			return nil, nil, err
+		}
+
+		dsn, ok := os.LookupEnv(mysqlDsnEnv)
+		if !ok {
+			return nil, nil, fmt.Errorf("%s is not set", mysqlDsnEnv)
+		}
+
+		store, err = NewMysqlStoreFromSqlStore(ctx, store, dsn, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		return store, cleanUp, nil
+	}
+
+	closeConnection := func() {
+		store.Close(ctx)
+	}
+
+	return store, closeConnection, nil
 }
 
 func loadSQL(db *gorm.DB, filepath string) error {

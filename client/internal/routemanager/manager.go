@@ -17,6 +17,7 @@ import (
 	firewall "github.com/netbirdio/netbird/client/firewall/manager"
 	"github.com/netbirdio/netbird/client/iface"
 	"github.com/netbirdio/netbird/client/iface/configurer"
+	"github.com/netbirdio/netbird/client/iface/netstack"
 	"github.com/netbirdio/netbird/client/internal/dns"
 	"github.com/netbirdio/netbird/client/internal/listener"
 	"github.com/netbirdio/netbird/client/internal/peer"
@@ -47,6 +48,21 @@ type Manager interface {
 	Stop(stateManager *statemanager.Manager)
 }
 
+type ManagerConfig struct {
+	Context             context.Context
+	PublicKey           string
+	DNSRouteInterval    time.Duration
+	WGInterface         iface.IWGIface
+	StatusRecorder      *peer.Status
+	RelayManager        *relayClient.Manager
+	InitialRoutes       []*route.Route
+	StateManager        *statemanager.Manager
+	DNSServer           dns.Server
+	PeerStore           *peerstore.Store
+	DisableClientRoutes bool
+	DisableServerRoutes bool
+}
+
 // DefaultManager is the default instance of a route manager
 type DefaultManager struct {
 	ctx                  context.Context
@@ -54,7 +70,7 @@ type DefaultManager struct {
 	mux                  sync.Mutex
 	clientNetworks       map[route.HAUniqueID]*clientNetwork
 	routeSelector        *routeselector.RouteSelector
-	serverRouter         serverRouter
+	serverRouter         *serverRouter
 	sysOps               *systemops.SysOps
 	statusRecorder       *peer.Status
 	relayMgr             *relayClient.Manager
@@ -66,60 +82,80 @@ type DefaultManager struct {
 	dnsRouteInterval     time.Duration
 	stateManager         *statemanager.Manager
 	// clientRoutes is the most recent list of clientRoutes received from the Management Service
-	clientRoutes   route.HAMap
-	dnsServer      dns.Server
-	peerStore      *peerstore.Store
-	useNewDNSRoute bool
+	clientRoutes        route.HAMap
+	dnsServer           dns.Server
+	peerStore           *peerstore.Store
+	useNewDNSRoute      bool
+	disableClientRoutes bool
+	disableServerRoutes bool
 }
 
-func NewManager(
-	ctx context.Context,
-	pubKey string,
-	dnsRouteInterval time.Duration,
-	wgInterface iface.IWGIface,
-	statusRecorder *peer.Status,
-	relayMgr *relayClient.Manager,
-	initialRoutes []*route.Route,
-	stateManager *statemanager.Manager,
-	dnsServer dns.Server,
-	peerStore *peerstore.Store,
-) *DefaultManager {
-	mCTX, cancel := context.WithCancel(ctx)
+func NewManager(config ManagerConfig) *DefaultManager {
+	mCTX, cancel := context.WithCancel(config.Context)
 	notifier := notifier.NewNotifier()
-	sysOps := systemops.NewSysOps(wgInterface, notifier)
+	sysOps := systemops.NewSysOps(config.WGInterface, notifier)
 
 	dm := &DefaultManager{
-		ctx:              mCTX,
-		stop:             cancel,
-		dnsRouteInterval: dnsRouteInterval,
-		clientNetworks:   make(map[route.HAUniqueID]*clientNetwork),
-		relayMgr:         relayMgr,
-		sysOps:           sysOps,
-		statusRecorder:   statusRecorder,
-		wgInterface:      wgInterface,
-		pubKey:           pubKey,
-		notifier:         notifier,
-		stateManager:     stateManager,
-		dnsServer:        dnsServer,
-		peerStore:        peerStore,
+		ctx:                 mCTX,
+		stop:                cancel,
+		dnsRouteInterval:    config.DNSRouteInterval,
+		clientNetworks:      make(map[route.HAUniqueID]*clientNetwork),
+		relayMgr:            config.RelayManager,
+		sysOps:              sysOps,
+		statusRecorder:      config.StatusRecorder,
+		wgInterface:         config.WGInterface,
+		pubKey:              config.PublicKey,
+		notifier:            notifier,
+		stateManager:        config.StateManager,
+		dnsServer:           config.DNSServer,
+		peerStore:           config.PeerStore,
+		disableClientRoutes: config.DisableClientRoutes,
+		disableServerRoutes: config.DisableServerRoutes,
 	}
 
-	dm.routeRefCounter = refcounter.New(
+	useNoop := netstack.IsEnabled() || config.DisableClientRoutes
+	dm.setupRefCounters(useNoop)
+
+	// don't proceed with client routes if it is disabled
+	if config.DisableClientRoutes {
+		return dm
+	}
+
+	if runtime.GOOS == "android" {
+		cr := dm.initialClientRoutes(config.InitialRoutes)
+		dm.notifier.SetInitialClientRoutes(cr)
+	}
+	return dm
+}
+
+func (m *DefaultManager) setupRefCounters(useNoop bool) {
+	m.routeRefCounter = refcounter.New(
 		func(prefix netip.Prefix, _ struct{}) (struct{}, error) {
-			return struct{}{}, sysOps.AddVPNRoute(prefix, wgInterface.ToInterface())
+			return struct{}{}, m.sysOps.AddVPNRoute(prefix, m.wgInterface.ToInterface())
 		},
 		func(prefix netip.Prefix, _ struct{}) error {
-			return sysOps.RemoveVPNRoute(prefix, wgInterface.ToInterface())
+			return m.sysOps.RemoveVPNRoute(prefix, m.wgInterface.ToInterface())
 		},
 	)
 
-	dm.allowedIPsRefCounter = refcounter.New(
+	if useNoop {
+		m.routeRefCounter = refcounter.New(
+			func(netip.Prefix, struct{}) (struct{}, error) {
+				return struct{}{}, refcounter.ErrIgnore
+			},
+			func(netip.Prefix, struct{}) error {
+				return nil
+			},
+		)
+	}
+
+	m.allowedIPsRefCounter = refcounter.New(
 		func(prefix netip.Prefix, peerKey string) (string, error) {
 			// save peerKey to use it in the remove function
-			return peerKey, wgInterface.AddAllowedIP(peerKey, prefix.String())
+			return peerKey, m.wgInterface.AddAllowedIP(peerKey, prefix.String())
 		},
 		func(prefix netip.Prefix, peerKey string) error {
-			if err := wgInterface.RemoveAllowedIP(peerKey, prefix.String()); err != nil {
+			if err := m.wgInterface.RemoveAllowedIP(peerKey, prefix.String()); err != nil {
 				if !errors.Is(err, configurer.ErrPeerNotFound) && !errors.Is(err, configurer.ErrAllowedIPNotFound) {
 					return err
 				}
@@ -128,19 +164,13 @@ func NewManager(
 			return nil
 		},
 	)
-
-	if runtime.GOOS == "android" {
-		cr := dm.initialClientRoutes(initialRoutes)
-		dm.notifier.SetInitialClientRoutes(cr)
-	}
-	return dm
 }
 
 // Init sets up the routing
 func (m *DefaultManager) Init() (nbnet.AddHookFunc, nbnet.RemoveHookFunc, error) {
 	m.routeSelector = m.initSelector()
 
-	if nbnet.CustomRoutingDisabled() {
+	if nbnet.CustomRoutingDisabled() || m.disableClientRoutes {
 		return nil, nil, nil
 	}
 
@@ -186,6 +216,15 @@ func (m *DefaultManager) initSelector() *routeselector.RouteSelector {
 }
 
 func (m *DefaultManager) EnableServerRouter(firewall firewall.Manager) error {
+	if m.disableServerRoutes {
+		log.Info("server routes are disabled")
+		return nil
+	}
+
+	if firewall == nil {
+		return errors.New("firewall manager is not set")
+	}
+
 	var err error
 	m.serverRouter, err = newServerRouter(m.ctx, m.wgInterface, firewall, m.statusRecorder)
 	if err != nil {
@@ -212,7 +251,7 @@ func (m *DefaultManager) Stop(stateManager *statemanager.Manager) {
 		}
 	}
 
-	if !nbnet.CustomRoutingDisabled() {
+	if !nbnet.CustomRoutingDisabled() && !m.disableClientRoutes {
 		if err := m.sysOps.CleanupRouting(stateManager); err != nil {
 			log.Errorf("Error cleaning up routing: %v", err)
 		} else {
@@ -242,18 +281,20 @@ func (m *DefaultManager) UpdateRoutes(updateSerial uint64, newRoutes []*route.Ro
 
 	newServerRoutesMap, newClientRoutesIDMap := m.classifyRoutes(newRoutes)
 
-	filteredClientRoutes := m.routeSelector.FilterSelected(newClientRoutesIDMap)
-	m.updateClientNetworks(updateSerial, filteredClientRoutes)
-	m.notifier.OnNewRoutes(filteredClientRoutes)
+	if !m.disableClientRoutes {
+		filteredClientRoutes := m.routeSelector.FilterSelected(newClientRoutesIDMap)
+		m.updateClientNetworks(updateSerial, filteredClientRoutes)
+		m.notifier.OnNewRoutes(filteredClientRoutes)
+	}
+	m.clientRoutes = newClientRoutesIDMap
 
-	if m.serverRouter != nil {
-		err := m.serverRouter.updateRoutes(newServerRoutesMap)
-		if err != nil {
-			return err
-		}
+	if m.serverRouter == nil {
+		return nil
 	}
 
-	m.clientRoutes = newClientRoutesIDMap
+	if err := m.serverRouter.updateRoutes(newServerRoutesMap); err != nil {
+		return fmt.Errorf("update routes: %w", err)
+	}
 
 	return nil
 }
@@ -382,11 +423,6 @@ func (m *DefaultManager) classifyRoutes(newRoutes []*route.Route) (map[route.ID]
 		haID := newRoute.GetHAUniqueID()
 		if newRoute.Peer == m.pubKey {
 			ownNetworkIDs[haID] = true
-			// only linux is supported for now
-			if runtime.GOOS != "linux" {
-				log.Warnf("received a route to manage, but agent doesn't support router mode on %s OS", runtime.GOOS)
-				continue
-			}
 			newServerRoutesMap[newRoute.ID] = newRoute
 		}
 	}
@@ -414,7 +450,7 @@ func (m *DefaultManager) initialClientRoutes(initialRoutes []*route.Route) []*ro
 }
 
 func isRouteSupported(route *route.Route) bool {
-	if !nbnet.CustomRoutingDisabled() || route.IsDynamic() {
+	if netstack.IsEnabled() || !nbnet.CustomRoutingDisabled() || route.IsDynamic() {
 		return true
 	}
 

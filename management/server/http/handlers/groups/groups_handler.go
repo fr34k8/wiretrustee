@@ -7,15 +7,14 @@ import (
 	"github.com/gorilla/mux"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/netbirdio/netbird/management/server/http/configs"
-	nbpeer "github.com/netbirdio/netbird/management/server/peer"
-	"github.com/netbirdio/netbird/management/server/types"
-
 	"github.com/netbirdio/netbird/management/server"
 	"github.com/netbirdio/netbird/management/server/http/api"
+	"github.com/netbirdio/netbird/management/server/http/configs"
 	"github.com/netbirdio/netbird/management/server/http/util"
 	"github.com/netbirdio/netbird/management/server/jwtclaims"
+	nbpeer "github.com/netbirdio/netbird/management/server/peer"
 	"github.com/netbirdio/netbird/management/server/status"
+	"github.com/netbirdio/netbird/management/server/types"
 )
 
 // handler is a handler that returns groups of the account
@@ -239,8 +238,9 @@ func (h *handler) deleteGroup(w http.ResponseWriter, r *http.Request) {
 
 	err = h.accountManager.DeleteGroup(r.Context(), accountID, userID, groupID)
 	if err != nil {
-		_, ok := err.(*server.GroupLinkError)
-		if ok {
+		wrappedErr, ok := err.(interface{ Unwrap() []error })
+		if ok && len(wrappedErr.Unwrap()) > 0 {
+			err = wrappedErr.Unwrap()[0]
 			util.WriteErrorResponse(err.Error(), http.StatusBadRequest, w)
 			return
 		}
