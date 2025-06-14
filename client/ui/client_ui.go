@@ -20,7 +20,10 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"fyne.io/systray"
@@ -51,7 +54,7 @@ const (
 )
 
 func main() {
-	daemonAddr, showSettings, showNetworks, showDebug, errorMsg, saveLogsInFile := parseFlags()
+	daemonAddr, showSettings, showNetworks, showLoginURL, showDebug, errorMsg, saveLogsInFile := parseFlags()
 
 	// Initialize file logging if needed.
 	var logFile string
@@ -77,13 +80,13 @@ func main() {
 	}
 
 	// Create the service client (this also builds the settings or networks UI if requested).
-	client := newServiceClient(daemonAddr, logFile, a, showSettings, showNetworks, showDebug)
+	client := newServiceClient(daemonAddr, logFile, a, showSettings, showNetworks, showLoginURL, showDebug)
 
 	// Watch for theme/settings changes to update the icon.
 	go watchSettingsChanges(a, client)
 
 	// Run in window mode if any UI flag was set.
-	if showSettings || showNetworks || showDebug {
+	if showSettings || showNetworks || showDebug || showLoginURL {
 		a.Run()
 		return
 	}
@@ -104,7 +107,7 @@ func main() {
 }
 
 // parseFlags reads and returns all needed command-line flags.
-func parseFlags() (daemonAddr string, showSettings, showNetworks, showDebug bool, errorMsg string, saveLogsInFile bool) {
+func parseFlags() (daemonAddr string, showSettings, showNetworks, showLoginURL, showDebug bool, errorMsg string, saveLogsInFile bool) {
 	defaultDaemonAddr := "unix:///var/run/netbird.sock"
 	if runtime.GOOS == "windows" {
 		defaultDaemonAddr = "tcp://127.0.0.1:41731"
@@ -112,6 +115,7 @@ func parseFlags() (daemonAddr string, showSettings, showNetworks, showDebug bool
 	flag.StringVar(&daemonAddr, "daemon-addr", defaultDaemonAddr, "Daemon service address to serve CLI requests [unix|tcp]://[path|host:port]")
 	flag.BoolVar(&showSettings, "settings", false, "run settings window")
 	flag.BoolVar(&showNetworks, "networks", false, "run networks window")
+	flag.BoolVar(&showLoginURL, "login-url", false, "show login URL in a popup window")
 	flag.BoolVar(&showDebug, "debug", false, "run debug window")
 	flag.StringVar(&errorMsg, "error-msg", "", "displays an error message window")
 	flag.BoolVar(&saveLogsInFile, "use-log-file", false, fmt.Sprintf("save logs in a file: %s/netbird-ui-PID.log", os.TempDir()))
@@ -170,6 +174,8 @@ type serviceClient struct {
 	addr   string
 	conn   proto.DaemonServiceClient
 
+	eventHandler *eventHandler
+
 	icAbout              []byte
 	icConnected          []byte
 	icDisconnected       []byte
@@ -217,6 +223,11 @@ type serviceClient struct {
 
 	// switch elements for settings form
 	sRosenpassPermissive *widget.Check
+	sNetworkMonitor      *widget.Check
+	sDisableDNS          *widget.Check
+	sDisableClientRoutes *widget.Check
+	sDisableServerRoutes *widget.Check
+	sBlockLANAccess      *widget.Check
 
 	// observable settings over corresponding iMngURL and iPreSharedKey values.
 	managementURL       string
@@ -225,6 +236,11 @@ type serviceClient struct {
 	RosenpassPermissive bool
 	interfaceName       string
 	interfacePort       int
+	networkMonitor      bool
+	disableDNS          bool
+	disableClientRoutes bool
+	disableServerRoutes bool
+	blockLANAccess      bool
 
 	connected            bool
 	update               *version.Update
@@ -241,6 +257,7 @@ type serviceClient struct {
 	exitNodeStates       []exitNodeState
 	mExitNodeDeselectAll *systray.MenuItem
 	logFile              string
+	wLoginURL            fyne.Window
 }
 
 type menuHandler struct {
@@ -251,7 +268,7 @@ type menuHandler struct {
 // newServiceClient instance constructor
 //
 // This constructor also builds the UI elements for the settings window.
-func newServiceClient(addr string, logFile string, a fyne.App, showSettings bool, showNetworks bool, showDebug bool) *serviceClient {
+func newServiceClient(addr string, logFile string, a fyne.App, showSettings bool, showNetworks bool, showLoginURL bool, showDebug bool) *serviceClient {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &serviceClient{
 		ctx:              ctx,
@@ -266,6 +283,7 @@ func newServiceClient(addr string, logFile string, a fyne.App, showSettings bool
 		update:               version.NewUpdate(),
 	}
 
+	s.eventHandler = newEventHandler(s)
 	s.setNewIcons()
 
 	switch {
@@ -273,6 +291,8 @@ func newServiceClient(addr string, logFile string, a fyne.App, showSettings bool
 		s.showSettingsUI()
 	case showNetworks:
 		s.showNetworksUI()
+	case showLoginURL:
+		s.showLoginURL()
 	case showDebug:
 		s.showDebugUI()
 	}
@@ -332,14 +352,20 @@ func (s *serviceClient) showSettingsUI() {
 	s.iPreSharedKey = widget.NewPasswordEntry()
 	s.iInterfaceName = widget.NewEntry()
 	s.iInterfacePort = widget.NewEntry()
+
 	s.sRosenpassPermissive = widget.NewCheck("Enable Rosenpass permissive mode", nil)
 
+	s.sNetworkMonitor = widget.NewCheck("Restarts NetBird when the network changes", nil)
+	s.sDisableDNS = widget.NewCheck("Keeps system DNS settings unchanged", nil)
+	s.sDisableClientRoutes = widget.NewCheck("This peer won't route traffic to other peers", nil)
+	s.sDisableServerRoutes = widget.NewCheck("This peer won't act as router for others", nil)
+	s.sBlockLANAccess = widget.NewCheck("Blocks local network access when used as exit node", nil)
+
 	s.wSettings.SetContent(s.getSettingsForm())
-	s.wSettings.Resize(fyne.NewSize(600, 400))
+	s.wSettings.Resize(fyne.NewSize(600, 500))
 	s.wSettings.SetFixedSize(true)
 
 	s.getSrvConfig()
-
 	s.wSettings.Show()
 }
 
@@ -355,6 +381,11 @@ func (s *serviceClient) getSettingsForm() *widget.Form {
 			{Text: "Pre-shared Key", Widget: s.iPreSharedKey},
 			{Text: "Config File", Widget: s.iConfigFile},
 			{Text: "Log File", Widget: s.iLogFile},
+			{Text: "Network Monitor", Widget: s.sNetworkMonitor},
+			{Text: "Disable DNS", Widget: s.sDisableDNS},
+			{Text: "Disable Client Routes", Widget: s.sDisableClientRoutes},
+			{Text: "Disable Server Routes", Widget: s.sDisableServerRoutes},
+			{Text: "Disable LAN Access", Widget: s.sBlockLANAccess},
 		},
 		SubmitText: "Save",
 		OnSubmit: func() {
@@ -377,11 +408,15 @@ func (s *serviceClient) getSettingsForm() *widget.Form {
 
 			defer s.wSettings.Close()
 
-			// If the management URL, pre-shared key, admin URL, Rosenpass permissive mode,
-			// interface name, or interface port have changed, we attempt to re-login with the new settings.
+			// Check if any settings have changed
 			if s.managementURL != iMngURL || s.preSharedKey != s.iPreSharedKey.Text ||
 				s.adminURL != iAdminURL || s.RosenpassPermissive != s.sRosenpassPermissive.Checked ||
-				s.interfaceName != s.iInterfaceName.Text || s.interfacePort != int(port) {
+				s.interfaceName != s.iInterfaceName.Text || s.interfacePort != int(port) ||
+				s.networkMonitor != s.sNetworkMonitor.Checked ||
+				s.disableDNS != s.sDisableDNS.Checked ||
+				s.disableClientRoutes != s.sDisableClientRoutes.Checked ||
+				s.disableServerRoutes != s.sDisableServerRoutes.Checked ||
+				s.blockLANAccess != s.sBlockLANAccess.Checked {
 
 				s.managementURL = iMngURL
 				s.preSharedKey = s.iPreSharedKey.Text
@@ -394,6 +429,11 @@ func (s *serviceClient) getSettingsForm() *widget.Form {
 					RosenpassPermissive: &s.sRosenpassPermissive.Checked,
 					InterfaceName:       &s.iInterfaceName.Text,
 					WireguardPort:       &port,
+					NetworkMonitor:      &s.sNetworkMonitor.Checked,
+					DisableDns:          &s.sDisableDNS.Checked,
+					DisableClientRoutes: &s.sDisableClientRoutes.Checked,
+					DisableServerRoutes: &s.sDisableServerRoutes.Checked,
+					BlockLanAccess:      &s.sBlockLANAccess.Checked,
 				}
 
 				if s.iPreSharedKey.Text != censoredPreSharedKey {
@@ -412,11 +452,11 @@ func (s *serviceClient) getSettingsForm() *widget.Form {
 	}
 }
 
-func (s *serviceClient) login() error {
+func (s *serviceClient) login(openURL bool) (*proto.LoginResponse, error) {
 	conn, err := s.getSrvClient(defaultFailTimeout)
 	if err != nil {
 		log.Errorf("get client: %v", err)
-		return err
+		return nil, err
 	}
 
 	loginResp, err := conn.Login(s.ctx, &proto.LoginRequest{
@@ -424,24 +464,24 @@ func (s *serviceClient) login() error {
 	})
 	if err != nil {
 		log.Errorf("login to management URL with: %v", err)
-		return err
+		return nil, err
 	}
 
-	if loginResp.NeedsSSOLogin {
+	if loginResp.NeedsSSOLogin && openURL {
 		err = open.Run(loginResp.VerificationURIComplete)
 		if err != nil {
 			log.Errorf("opening the verification uri in the browser failed: %v", err)
-			return err
+			return nil, err
 		}
 
 		_, err = conn.WaitSSOLogin(s.ctx, &proto.WaitSSOLoginRequest{UserCode: loginResp.UserCode})
 		if err != nil {
 			log.Errorf("waiting sso login failed with: %v", err)
-			return err
+			return nil, err
 		}
 	}
 
-	return nil
+	return loginResp, nil
 }
 
 func (s *serviceClient) menuUpClick() error {
@@ -453,7 +493,7 @@ func (s *serviceClient) menuUpClick() error {
 		return err
 	}
 
-	err = s.login()
+	_, err = s.login(true)
 	if err != nil {
 		log.Errorf("login failed with: %v", err)
 		return err
@@ -525,14 +565,14 @@ func (s *serviceClient) updateStatus() error {
 		defer s.updateIndicationLock.Unlock()
 
 		// notify the user when the session has expired
-		if status.Status == string(internal.StatusNeedsLogin) {
+		if status.Status == string(internal.StatusSessionExpired) {
 			s.onSessionExpire()
 		}
 
 		var systrayIconState bool
 
 		switch {
-		case status.Status == string(internal.StatusConnected):
+		case status.Status == string(internal.StatusConnected) && !s.mUp.Disabled():
 			s.connected = true
 			s.sendNotification = true
 			if s.isUpdateIconActive {
@@ -696,161 +736,7 @@ func (s *serviceClient) onTrayReady() {
 	})
 
 	go s.eventManager.Start(s.ctx)
-
-	go s.listenEvents()
-}
-
-func (s *serviceClient) listenEvents() {
-	for {
-		select {
-		case <-s.mUp.ClickedCh:
-			s.mUp.Disable()
-			go func() {
-				defer s.mUp.Enable()
-				err := s.menuUpClick()
-				if err != nil {
-					s.app.SendNotification(fyne.NewNotification("Error", "Failed to connect to NetBird service"))
-					return
-				}
-			}()
-		case <-s.mDown.ClickedCh:
-			s.mDown.Disable()
-			go func() {
-				defer s.mDown.Enable()
-				err := s.menuDownClick()
-				if err != nil {
-					s.app.SendNotification(fyne.NewNotification("Error", "Failed to connect to NetBird service"))
-					return
-				}
-			}()
-		case <-s.mAllowSSH.ClickedCh:
-			if s.mAllowSSH.Checked() {
-				s.mAllowSSH.Uncheck()
-			} else {
-				s.mAllowSSH.Check()
-			}
-			if err := s.updateConfig(); err != nil {
-				log.Errorf("failed to update config: %v", err)
-			}
-		case <-s.mAutoConnect.ClickedCh:
-			if s.mAutoConnect.Checked() {
-				s.mAutoConnect.Uncheck()
-			} else {
-				s.mAutoConnect.Check()
-			}
-			if err := s.updateConfig(); err != nil {
-				log.Errorf("failed to update config: %v", err)
-			}
-		case <-s.mEnableRosenpass.ClickedCh:
-			if s.mEnableRosenpass.Checked() {
-				s.mEnableRosenpass.Uncheck()
-			} else {
-				s.mEnableRosenpass.Check()
-			}
-			if err := s.updateConfig(); err != nil {
-				log.Errorf("failed to update config: %v", err)
-			}
-		case <-s.mLazyConnEnabled.ClickedCh:
-			if s.mLazyConnEnabled.Checked() {
-				s.mLazyConnEnabled.Uncheck()
-			} else {
-				s.mLazyConnEnabled.Check()
-			}
-			if err := s.updateConfig(); err != nil {
-				log.Errorf("failed to update config: %v", err)
-			}
-		case <-s.mBlockInbound.ClickedCh:
-			if s.mBlockInbound.Checked() {
-				s.mBlockInbound.Uncheck()
-			} else {
-				s.mBlockInbound.Check()
-			}
-			if err := s.updateConfig(); err != nil {
-				log.Errorf("failed to update config: %v", err)
-			}
-		case <-s.mAdvancedSettings.ClickedCh:
-			s.mAdvancedSettings.Disable()
-			go func() {
-				defer s.mAdvancedSettings.Enable()
-				defer s.getSrvConfig()
-				s.runSelfCommand("settings", "true")
-			}()
-		case <-s.mCreateDebugBundle.ClickedCh:
-			s.mCreateDebugBundle.Disable()
-			go func() {
-				defer s.mCreateDebugBundle.Enable()
-				s.runSelfCommand("debug", "true")
-			}()
-		case <-s.mQuit.ClickedCh:
-			systray.Quit()
-			return
-		case <-s.mGitHub.ClickedCh:
-			err := openURL("https://github.com/netbirdio/netbird")
-			if err != nil {
-				log.Errorf("%s", err)
-			}
-		case <-s.mUpdate.ClickedCh:
-			err := openURL(version.DownloadUrl())
-			if err != nil {
-				log.Errorf("%s", err)
-			}
-		case <-s.mNetworks.ClickedCh:
-			s.mNetworks.Disable()
-			go func() {
-				defer s.mNetworks.Enable()
-				s.runSelfCommand("networks", "true")
-			}()
-		case <-s.mNotifications.ClickedCh:
-			if s.mNotifications.Checked() {
-				s.mNotifications.Uncheck()
-			} else {
-				s.mNotifications.Check()
-			}
-			if s.eventManager != nil {
-				s.eventManager.SetNotificationsEnabled(s.mNotifications.Checked())
-			}
-			if err := s.updateConfig(); err != nil {
-				log.Errorf("failed to update config: %v", err)
-			}
-		}
-	}
-}
-
-func (s *serviceClient) runSelfCommand(command, arg string) {
-	proc, err := os.Executable()
-	if err != nil {
-		log.Errorf("Error getting executable path: %v", err)
-		return
-	}
-
-	cmd := exec.Command(proc,
-		fmt.Sprintf("--%s=%s", command, arg),
-		fmt.Sprintf("--daemon-addr=%s", s.addr),
-	)
-
-	if out := s.attachOutput(cmd); out != nil {
-		defer func() {
-			if err := out.Close(); err != nil {
-				log.Errorf("Error closing log file %s: %v", s.logFile, err)
-			}
-		}()
-	}
-
-	log.Printf("Running command: %s --%s=%s --daemon-addr=%s", proc, command, arg, s.addr)
-
-	err = cmd.Run()
-
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			log.Printf("Command '%s %s' failed with exit code %d", command, arg, exitErr.ExitCode())
-		} else {
-			log.Printf("Failed to start/run command '%s %s': %v", command, arg, err)
-		}
-		return
-	}
-
-	log.Printf("Command '%s %s' completed successfully.", command, arg)
+	go s.eventHandler.listen(s.ctx)
 }
 
 func (s *serviceClient) attachOutput(cmd *exec.Cmd) *os.File {
@@ -937,6 +823,12 @@ func (s *serviceClient) getSrvConfig() {
 	s.interfaceName = cfg.InterfaceName
 	s.interfacePort = int(cfg.WireguardPort)
 
+	s.networkMonitor = cfg.NetworkMonitor
+	s.disableDNS = cfg.DisableDns
+	s.disableClientRoutes = cfg.DisableClientRoutes
+	s.disableServerRoutes = cfg.DisableServerRoutes
+	s.blockLANAccess = cfg.BlockLanAccess
+
 	if s.showAdvancedSettings {
 		s.iMngURL.SetText(s.managementURL)
 		s.iAdminURL.SetText(s.adminURL)
@@ -949,6 +841,11 @@ func (s *serviceClient) getSrvConfig() {
 		if !cfg.RosenpassEnabled {
 			s.sRosenpassPermissive.Disable()
 		}
+		s.sNetworkMonitor.SetChecked(cfg.NetworkMonitor)
+		s.sDisableDNS.SetChecked(cfg.DisableDns)
+		s.sDisableClientRoutes.SetChecked(cfg.DisableClientRoutes)
+		s.sDisableServerRoutes.SetChecked(cfg.DisableServerRoutes)
+		s.sBlockLANAccess.SetChecked(cfg.BlockLanAccess)
 	}
 
 	if s.mNotifications == nil {
@@ -962,7 +859,6 @@ func (s *serviceClient) getSrvConfig() {
 	if s.eventManager != nil {
 		s.eventManager.SetNotificationsEnabled(s.mNotifications.Checked())
 	}
-
 }
 
 func (s *serviceClient) onUpdateAvailable() {
@@ -981,17 +877,9 @@ func (s *serviceClient) onUpdateAvailable() {
 
 // onSessionExpire sends a notification to the user when the session expires.
 func (s *serviceClient) onSessionExpire() {
+	s.sendNotification = true
 	if s.sendNotification {
-		title := "Connection session expired"
-		if runtime.GOOS == "darwin" {
-			title = "NetBird connection session expired"
-		}
-		s.app.SendNotification(
-			fyne.NewNotification(
-				title,
-				"Please re-authenticate to connect to the network",
-			),
-		)
+		s.eventHandler.runSelfCommand("login-url", "true")
 		s.sendNotification = false
 	}
 }
@@ -1099,6 +987,87 @@ func (s *serviceClient) restartClient(loginRequest *proto.LoginRequest) error {
 	}
 
 	return nil
+}
+
+// showLoginURL creates a borderless window styled like a pop-up in the top-right corner using s.wLoginURL.
+func (s *serviceClient) showLoginURL() {
+
+	resp, err := s.login(false)
+	if err != nil {
+		log.Errorf("failed to fetch login URL: %v", err)
+		return
+	}
+	verificationURL := resp.VerificationURIComplete
+	if verificationURL == "" {
+		verificationURL = resp.VerificationURI
+	}
+
+	if verificationURL == "" {
+		log.Error("no verification URL provided in the login response")
+		return
+	}
+
+	resIcon := fyne.NewStaticResource("netbird.png", iconAbout)
+
+	if s.wLoginURL == nil {
+		s.wLoginURL = s.app.NewWindow("NetBird Session Expired")
+		s.wLoginURL.Resize(fyne.NewSize(400, 200))
+		s.wLoginURL.SetIcon(resIcon)
+	}
+	// add a description label
+	label := widget.NewLabel("Your NetBird session has expired.\nPlease re-authenticate to continue using NetBird.")
+
+	btn := widget.NewButtonWithIcon("Re-authenticate", theme.ViewRefreshIcon(), func() {
+
+		conn, err := s.getSrvClient(defaultFailTimeout)
+		if err != nil {
+			log.Errorf("get client: %v", err)
+			return
+		}
+
+		if err := openURL(verificationURL); err != nil {
+			log.Errorf("failed to open login URL: %v", err)
+			return
+		}
+
+		_, err = conn.WaitSSOLogin(s.ctx, &proto.WaitSSOLoginRequest{UserCode: resp.UserCode})
+		if err != nil {
+			log.Errorf("Waiting sso login failed with: %v", err)
+			label.SetText("Waiting login failed, please create \na debug bundle in the settings and contact support.")
+			return
+		}
+
+		label.SetText("Re-authentication successful.\nReconnecting")
+		time.Sleep(300 * time.Millisecond)
+		_, err = conn.Up(s.ctx, &proto.UpRequest{})
+		if err != nil {
+			label.SetText("Reconnecting failed, please create \na debug bundle in the settings and contact support.")
+			log.Errorf("Reconnecting failed with: %v", err)
+			return
+		}
+
+		label.SetText("Connection successful.\nClosing this window.")
+		time.Sleep(time.Second)
+
+		s.wLoginURL.Close()
+	})
+
+	img := canvas.NewImageFromResource(resIcon)
+	img.FillMode = canvas.ImageFillContain
+	img.SetMinSize(fyne.NewSize(64, 64))
+	img.Resize(fyne.NewSize(64, 64))
+
+	// center the content vertically
+	content := container.NewVBox(
+		layout.NewSpacer(),
+		img,
+		label,
+		btn,
+		layout.NewSpacer(),
+	)
+	s.wLoginURL.SetContent(container.NewCenter(content))
+
+	s.wLoginURL.Show()
 }
 
 func openURL(url string) error {
