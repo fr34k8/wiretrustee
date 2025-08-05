@@ -26,8 +26,8 @@ import (
 	"github.com/netbirdio/netbird/client/internal/auth"
 	"github.com/netbirdio/netbird/client/internal/profilemanager"
 	"github.com/netbirdio/netbird/client/system"
-	mgm "github.com/netbirdio/netbird/management/client"
-	"github.com/netbirdio/netbird/management/domain"
+	mgm "github.com/netbirdio/netbird/shared/management/client"
+	"github.com/netbirdio/netbird/shared/management/domain"
 
 	"github.com/netbirdio/netbird/client/internal"
 	"github.com/netbirdio/netbird/client/internal/peer"
@@ -70,11 +70,11 @@ type Server struct {
 	statusRecorder *peer.Status
 	sessionWatcher *internal.SessionWatcher
 
-	lastProbe         time.Time
-	persistNetworkMap bool
-	isSessionActive   atomic.Bool
+	lastProbe           time.Time
+	persistSyncResponse bool
+	isSessionActive     atomic.Bool
 
-	profileManager   profilemanager.ServiceManager
+	profileManager   *profilemanager.ServiceManager
 	profilesDisabled bool
 }
 
@@ -86,14 +86,14 @@ type oauthAuthFlow struct {
 }
 
 // New server instance constructor.
-func New(ctx context.Context, logFile string, profilesDisabled bool) *Server {
+func New(ctx context.Context, logFile string, configFile string, profilesDisabled bool) *Server {
 	return &Server{
-		rootCtx:           ctx,
-		logFile:           logFile,
-		persistNetworkMap: true,
-		statusRecorder:    peer.NewRecorder(""),
-		profileManager:    profilemanager.ServiceManager{},
-		profilesDisabled:  profilesDisabled,
+		rootCtx:             ctx,
+		logFile:             logFile,
+		persistSyncResponse: true,
+		statusRecorder:      peer.NewRecorder(""),
+		profileManager:      profilemanager.NewServiceManager(configFile),
+		profilesDisabled:    profilesDisabled,
 	}
 }
 
@@ -233,7 +233,7 @@ func (s *Server) connectWithRetryRuns(ctx context.Context, config *profilemanage
 	runOperation := func() error {
 		log.Tracef("running client connection")
 		s.connectClient = internal.NewConnectClient(ctx, config, statusRecorder)
-		s.connectClient.SetNetworkMapPersistence(s.persistNetworkMap)
+		s.connectClient.SetSyncResponsePersistence(s.persistSyncResponse)
 
 		err := s.connectClient.Run(runningChan)
 		if err != nil {
