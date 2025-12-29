@@ -1910,16 +1910,17 @@ func (s *SqlStore) getPolicyRules(ctx context.Context, policyIDs []string) ([]*t
 	if len(policyIDs) == 0 {
 		return nil, nil
 	}
-	const query = `SELECT id, policy_id, name, description, enabled, action, destinations, destination_resource, sources, source_resource, bidirectional, protocol, ports, port_ranges FROM policy_rules WHERE policy_id = ANY($1)`
+	const query = `SELECT id, policy_id, name, description, enabled, action, destinations, destination_resource, sources, source_resource, bidirectional, protocol, ports, port_ranges, authorized_groups, authorized_user FROM policy_rules WHERE policy_id = ANY($1)`
 	rows, err := s.pool.Query(ctx, query, policyIDs)
 	if err != nil {
 		return nil, err
 	}
 	rules, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (*types.PolicyRule, error) {
 		var r types.PolicyRule
-		var dest, destRes, sources, sourceRes, ports, portRanges []byte
+		var dest, destRes, sources, sourceRes, ports, portRanges, authorizedGroups []byte
 		var enabled, bidirectional sql.NullBool
-		err := row.Scan(&r.ID, &r.PolicyID, &r.Name, &r.Description, &enabled, &r.Action, &dest, &destRes, &sources, &sourceRes, &bidirectional, &r.Protocol, &ports, &portRanges)
+		var authorizedUser sql.NullString
+		err := row.Scan(&r.ID, &r.PolicyID, &r.Name, &r.Description, &enabled, &r.Action, &dest, &destRes, &sources, &sourceRes, &bidirectional, &r.Protocol, &ports, &portRanges, &authorizedGroups, &authorizedUser)
 		if err == nil {
 			if enabled.Valid {
 				r.Enabled = enabled.Bool
@@ -1944,6 +1945,12 @@ func (s *SqlStore) getPolicyRules(ctx context.Context, policyIDs []string) ([]*t
 			}
 			if portRanges != nil {
 				_ = json.Unmarshal(portRanges, &r.PortRanges)
+			}
+			if authorizedGroups != nil {
+				_ = json.Unmarshal(authorizedGroups, &r.AuthorizedGroups)
+			}
+			if authorizedUser.Valid {
+				r.AuthorizedUser = authorizedUser.String
 			}
 		}
 		return &r, err
